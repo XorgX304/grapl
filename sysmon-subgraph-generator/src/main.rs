@@ -3,7 +3,6 @@ extern crate chrono;
 extern crate failure;
 extern crate futures;
 extern crate graph_descriptions;
-
 extern crate lambda_runtime as lambda;
 #[macro_use]
 extern crate lazy_static;
@@ -21,15 +20,26 @@ extern crate sysmon;
 extern crate uuid;
 
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::fmt::Debug;
+use std::io::Cursor;
 use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_lambda_events::event::sqs::{SqsEvent, SqsMessage};
 use chrono::prelude::*;
 use failure::bail;
 use failure::Error;
 use futures::{Future, Stream};
+use graph_descriptions::*;
+use graph_descriptions::file::FileState;
+use graph_descriptions::graph_description::*;
+use graph_descriptions::network_connection::NetworkConnectionState;
+use graph_descriptions::process::ProcessState;
+use graph_descriptions::process_inbound_connection::ProcessInboundConnectionState;
+use graph_descriptions::process_outbound_connection::ProcessOutboundConnectionState;
 use lambda::Context;
 use lambda::error::HandlerError;
 use lambda::Handler;
@@ -44,7 +54,8 @@ use rusoto_s3::{GetObjectRequest, S3};
 use rusoto_s3::S3Client;
 use rusoto_sqs::{GetQueueUrlRequest, Sqs, SqsClient};
 use serde::Deserialize;
-
+use sqs_lambda::cache::Cache;
+use sqs_lambda::cache::CacheResponse;
 use sqs_lambda::completion_event_serializer::CompletionEventSerializer;
 use sqs_lambda::event_decoder::PayloadDecoder;
 use sqs_lambda::event_emitter::S3EventEmitter;
@@ -54,28 +65,12 @@ use sqs_lambda::event_retriever::S3PayloadRetriever;
 use sqs_lambda::redis_cache::RedisCache;
 use sqs_lambda::sqs_completion_handler::{CompletionPolicy, SqsCompletionHandler, SqsCompletionHandlerActor};
 use sqs_lambda::sqs_consumer::{ConsumePolicy, SqsConsumer, SqsConsumerActor};
-use sqs_lambda::cache::CacheResponse;
-use async_trait::async_trait;
-
-
 use sysmon::*;
 use uuid::Uuid;
 
-use graph_descriptions::*;
-use graph_descriptions::file::FileState;
-use graph_descriptions::graph_description::*;
-use graph_descriptions::network_connection::NetworkConnectionState;
+use async_trait::async_trait;
 
-use graph_descriptions::process::ProcessState;
-use graph_descriptions::process_inbound_connection::ProcessInboundConnectionState;
-use graph_descriptions::process_outbound_connection::ProcessOutboundConnectionState;
 use crate::graph_descriptions::node::NodeT;
-
-use std::io::Cursor;
-use sqs_lambda::cache::Cache;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use std::collections::HashSet;
-
 
 macro_rules! log_time {
     ($msg:expr, $x:expr) => {
@@ -530,8 +525,8 @@ impl CompletionEventSerializer for SubgraphSerializer {
         if subgraph.is_empty() {
             warn!(
                 concat!(
-                    "Output subgraph is empty. Serializing to empty vector.",
-                    "pre_nodes: {} pre_edges: {}"
+                "Output subgraph is empty. Serializing to empty vector.",
+                "pre_nodes: {} pre_edges: {}"
                 ),
                 pre_nodes,
                 pre_edges,
@@ -581,24 +576,33 @@ impl PayloadDecoder<Vec<u8>> for ZstdDecoder
 
 
 #[derive(Clone)]
-struct SysmonSubgraphGenerator {
-    cache: RedisCache,
+struct SysmonSubgraphGenerator<C, E>
+    where C: sqs_lambda::cache::Cache<E> + Clone + Send + Sync + 'static,
+          E: Debug + Clone + Send + Sync + 'static
+{
+    cache: C,
+    _p: std::marker::PhantomData<E>,
 }
 
-impl SysmonSubgraphGenerator {
-    pub fn new(cache: RedisCache) -> Self {
-        Self { cache }
+impl<C, E> SysmonSubgraphGenerator<C, E>
+    where C: sqs_lambda::cache::Cache<E> + Clone + Send + Sync + 'static,
+          E: Debug + Clone + Send + Sync + 'static
+{
+    pub fn new(cache: C) -> Self {
+        Self { cache, _p: std::marker::PhantomData }
     }
 }
 
 #[async_trait]
-impl EventHandler for SysmonSubgraphGenerator
+impl<C, E> EventHandler for SysmonSubgraphGenerator<C, E>
+    where C: sqs_lambda::cache::Cache<E> + Clone + Send + Sync + 'static,
+          E: Debug + Clone + Send + Sync + 'static
 {
     type InputEvent = Vec<u8>;
     type OutputEvent = Graph;
     type Error = Arc<failure::Error>;
 
-    async fn handle_event(&mut self, events: Vec<u8>) -> OutputEvent<Self::OutputEvent, Self::Error> {
+    async fn handle_event(&mut self, events: Self::InputEvent) -> OutputEvent<Self::OutputEvent, Self::Error> {
         info!("Handling raw event");
 
         let mut failed: Option<failure::Error> = None;
@@ -637,10 +641,10 @@ impl EventHandler for SysmonSubgraphGenerator
             };
 
             match self.cache.get(event.clone()).await {
-                Ok(CacheResponse::Hit) =>  {
+                Ok(CacheResponse::Hit) => {
                     info!("Got cached response");
-                    continue
-                },
+                    continue;
+                }
                 Err(e) => warn!("Cache failed with: {:?}", e),
                 _ => ()
             };
@@ -701,6 +705,7 @@ impl EventHandler for SysmonSubgraphGenerator
         }
 
         info!("Completed mapping {} subgraphs", identities.len());
+
 
         let mut completed = if let Some(e) = failed {
             OutputEvent::new(
@@ -789,7 +794,7 @@ fn handler(event: SqsEvent, ctx: Context) -> Result<(), HandlerError> {
 
                 let cache = RedisCache::new(cache_address.to_owned()).await.expect("Could not create redis client");
 
-                let node_identifier = SysmonSubgraphGenerator::new(
+                let sysmon_subgraph_generator = SysmonSubgraphGenerator::new(
                     cache.clone()
                 );
 
@@ -822,7 +827,7 @@ fn handler(event: SqsEvent, ctx: Context) -> Result<(), HandlerError> {
                                 }
                             }
                         },
-                        cache.clone()
+                        cache.clone(),
                     )
                 );
 
@@ -854,7 +859,7 @@ fn handler(event: SqsEvent, ctx: Context) -> Result<(), HandlerError> {
                         EventProcessorActor::new(EventProcessor::new(
                             sqs_consumer.clone(),
                             sqs_completion_handler.clone(),
-                            node_identifier.clone(),
+                            sysmon_subgraph_generator.clone(),
                             S3PayloadRetriever::new(S3Client::new(region.clone()), ZstdDecoder::default()),
                         ))
                     })
@@ -925,33 +930,50 @@ mod tests {
     use rusoto_core::credential::StaticProvider;
     use rusoto_core::HttpClient;
     use rusoto_s3::CreateBucketRequest;
+    use sqs_lambda::cache::NopCache;
+    use tokio::prelude::*;
+    use tokio::runtime::Runtime;
 
     use super::*;
+    use std::fs::File;
+    use std::io::Read;
+
+    fn read_to_vec(path: &str) -> Vec<u8> {
+        let mut f = File::open(path).expect("path");
+        let mut buf = Vec::new();
+
+        f.read_to_end(&mut buf  ).unwrap();
+        buf
+    }
 
     #[test]
     fn parse_time() {
         let utc_time = "2017-04-28 22:08:22.025";
         let ts = utc_to_epoch(utc_time).expect("parsing utc_time failed");
-        println!("{}", ts);
     }
 
     #[test]
     fn test_handler() {
-        let region = Region::Custom {
-            name: "us-east-1".to_string(),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-        };
+        let mut rt = Runtime::new().unwrap();
 
-        std::env::set_var("BUCKET_PREFIX", "unique_id");
+        let logs = read_to_vec("./test_data/eventlog.xml");
 
-        let handler = SysmonSubgraphGenerator::new(
-            move |generated_subgraphs| {
-                println!("generated subgraphs");
-                Ok(())
-            }
-        );
+        rt.block_on(async {
+            let mut handler = SysmonSubgraphGenerator::new(
+                NopCache {}
+            );
 
-        handler.handle_event(vec![]).expect("handle_event failed");
+            let result = handler.handle_event(
+                logs
+            ).await;
+
+            match result.completed_event {
+                Completion::Total(t) => assert!(!t.is_empty()),
+                Completion::Error(e) => panic!(e),
+                Completion::Partial((_t, e)) => panic!(e),
+            };
+
+        });
     }
 }
 

@@ -369,6 +369,7 @@ def respond(err, res=None, headers=None):
     if not headers:
         headers = {}
 
+    print(f'Responding with origin {ORIGIN_OVERRIDE or ORIGIN}')
     return {
         'statusCode': '400' if err else '200',
         'body': {'error': err} if err else json.dumps({'success': res}),
@@ -497,8 +498,10 @@ def lambda_handler(event, context):
             print('login')
             cookie = lambda_login(event)
             if cookie:
+                print('Successfully logged in')
                 return respond(None, 'True', headers={'Set-Cookie': cookie})
             else:
+                print('Failed to login')
                 return respond('Failed to login')
 
         if '/checkLogin' in event['path']:
@@ -509,6 +512,7 @@ def lambda_handler(event, context):
                 return respond(None, 'False')
 
         if not check_jwt(event['headers']):
+            print('Must log in')
             return respond("Must log in")
 
         if '/update' in event['path']:

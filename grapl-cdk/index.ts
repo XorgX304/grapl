@@ -165,7 +165,7 @@ class EngagementEdge extends cdk.Stack {
                     "EG_ALPHAS": engagement_graph.alphaNames.join(","),
                     "JWT_SECRET": jwt_secret,
                     "USER_AUTH_TABLE": user_auth_table.user_auth_table.tableName,
-                    "BUCKET_PREFIX": process.env.BUCKET_PREFIX
+                    "BUCKET_PREFIX": process.env.BUCKET_PREFIX,
                 },
                 timeout: Duration.seconds(25),
                 memorySize: 256,
@@ -1159,12 +1159,11 @@ const getEdgeGatewayId = (integrationName: string, cb) => {
 
         for (const item of data.items) {
             if (item.name === integrationName) {
-                console.log(`restApi ID ${item.id}`);
                 cb(item.id);
                 return
             }
         }
-        console.assert(false, 'Could not find any integrations. Ensure you have deployed engagement edge.')
+        console.warn(false, 'Could not find any integrations. Ensure you have deployed engagement edge.')
     });
 };
 
@@ -1395,12 +1394,46 @@ class HistoryDb extends cdk.Stack {
     }
 }
 
+const get_args = (args) => {
+    const parsed_args = {
+        BUCKET_PREFIX: null,
+        AWS_REGION: null,
+    };
+
+    for (const arg of args) {
+        if (arg.startsWith("--BUCKET_PREFIX=")) {
+            parsed_args.BUCKET_PREFIX = arg.split("--BUCKET_PREFIX=")[1]
+        }
+
+        if (arg.startsWith("--AWS_REGION=")) {
+            parsed_args.AWS_REGION = arg.split("--AWS_REGION=")[1]
+        }
+    }
+
+    return parsed_args
+};
+
 
 class Grapl extends cdk.App {
     constructor() {
         super();
 
-        env(__dirname + '/.env');
+        try {
+            env(__dirname + '/.env');
+        }catch (_) {
+        }
+
+
+        const args = get_args(process.argv);
+        if (args.BUCKET_PREFIX) {
+            process.env.BUCKET_PREFIX = args.BUCKET_PREFIX;
+        }
+
+        if (args.AWS_REGION) {
+            AWS.config.update({region:args.AWS_REGION});
+        }
+
+        console.assert(process.env.BUCKET_PREFIX, "Must set BUCKET_PREFIX in .env or as arg")
 
         const mgZeroCount = Number(process.env.MG_ZEROS_COUNT) || 1;
         const mgAlphaCount = Number(process.env.MG_ALPHAS_COUNT) || 1;

@@ -147,7 +147,7 @@ async fn node_key_to_uid(dg: &DgraphClient, node_key: &str) -> Result<Option<Str
     Ok(uid)
 }
 
-async fn upsert_node(dg: &DgraphClient, node: Node) -> Result<String, Error> {
+async fn upsert_node(dg: &DgraphClient, node: Node, index_time: u64) -> Result<String, Error> {
     let node_key = node.clone_node_key();
     let query = format!(r#"
                 {{
@@ -158,6 +158,7 @@ async fn upsert_node(dg: &DgraphClient, node: Node) -> Result<String, Error> {
     let node_key = node.clone_node_key();
     let mut set_json = node.into_json();
     set_json["uid"] = "uid(p)".into();
+    set_json["last_index_time"] = index_time.into();
 
 
     let mu = api::Mutation {
@@ -414,7 +415,6 @@ impl CompletionEventSerializer for SubgraphSerializer {
 
 
 fn time_based_key_fn(_event: &[u8]) -> String {
-    info!("event length {}", _event.len());
     let cur_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(n) => n.as_millis(),
         Err(_) => panic!("SystemTime before UNIX EPOCH!"),
@@ -650,8 +650,13 @@ impl EventHandler for GraphMerger
 
         let mut node_key_to_uid = HashMap::new();
 
+        let ts = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(n) => n.as_secs(),
+            Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+        };
+
         let upserts = subgraph.nodes.values().map(|node| {
-            upsert_node(&mg_client, node.clone()).map(move |u| (node.get_node_key(), u))
+            upsert_node(&mg_client, node.clone(), ts).map(move |u| (node.get_node_key(), u))
         });
 
         let upserts = log_time!("All upserts", join_all(upserts).await);
